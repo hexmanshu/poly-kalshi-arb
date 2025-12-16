@@ -1,0 +1,107 @@
+# Continuous Integration - Build and Test
+# Runs on every push and pull request
+# NO SECRETS REQUIRED - works immediately after fork/clone
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ci-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build debug
+        run: cargo build --all-targets
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Build all binaries
+        run: |
+          cargo build --release --bin arb-bot
+          cargo build --release --bin backtest-report
+          cargo build --release --bin price-collector
+
+      - name: Verify binaries
+        run: |
+          ls -la target/release/arb-bot
+          ls -la target/release/backtest-report
+          ls -la target/release/price-collector
+          ./target/release/price-collector --help
+          ./target/release/backtest-report --help || true
+
+      - name: Summary
+        run: |
+          echo "### CI Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Format:** ✅ Checked" >> $GITHUB_STEP_SUMMARY
+          echo "- **Clippy:** ✅ No warnings" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests:** ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build:** ✅ Release binaries built" >> $GITHUB_STEP_SUMMARY
+
+  # Run SAST security scan
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: Run cargo audit
+        run: cargo audit || true
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          echo "### Security Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run \`cargo audit\` locally for full vulnerability details." >> $GITHUB_STEP_SUMMARY

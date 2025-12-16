@@ -2,10 +2,11 @@
 # This workflow runs the full bot in DRY_RUN mode for up to 6 hours
 # to collect real market data and test strategies.
 #
-# Designed for:
-# - NFL Sundays (high sports betting activity)
-# - EPL Saturdays (soccer matches)
-# - NBA evenings
+# SECRETS (Optional - enhances functionality):
+#   KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY - For authenticated Kalshi access
+#   POLY_PRIVATE_KEY, POLY_FUNDER - For authenticated Polymarket access
+#
+# Without secrets: Runs public-only price collection instead
 
 name: Backtest Session
 
@@ -32,7 +33,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -57,6 +58,30 @@ jobs:
           path: .
         continue-on-error: true
 
+      - name: Download previous price snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: price-snapshots-db
+          path: .
+        continue-on-error: true
+
+      - name: Check secrets availability
+        id: secrets
+        run: |
+          if [ -n "${{ secrets.KALSHI_API_KEY_ID }}" ] && [ -n "${{ secrets.POLY_PRIVATE_KEY }}" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "✅ Secrets configured - will run full backtest"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Secrets not configured - will run public price collection only"
+            echo ""
+            echo "To enable full backtesting, add these repository secrets:"
+            echo "  - KALSHI_API_KEY_ID"
+            echo "  - KALSHI_PRIVATE_KEY"
+            echo "  - POLY_PRIVATE_KEY"
+            echo "  - POLY_FUNDER"
+          fi
+
       - name: Determine duration
         id: duration
         run: |
@@ -66,12 +91,15 @@ jobs:
           echo "hours=$HOURS" >> $GITHUB_OUTPUT
           echo "seconds=$((HOURS * 3600))" >> $GITHUB_OUTPUT
 
+      # === FULL BACKTEST MODE (with secrets) ===
       - name: Create Kalshi key file
+        if: steps.secrets.outputs.available == 'true'
         run: |
           echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > /tmp/kalshi_key.pem
           chmod 600 /tmp/kalshi_key.pem
 
-      - name: Run backtest session
+      - name: Run full backtest session
+        if: steps.secrets.outputs.available == 'true'
         env:
           DRY_RUN: "1"
           BACKTEST: "1"
@@ -81,10 +109,31 @@ jobs:
           POLY_FUNDER: ${{ secrets.POLY_FUNDER }}
           RUST_LOG: "info"
         run: |
-          echo "Starting ${{ steps.duration.outputs.hours }}h backtest session..."
+          echo "Starting ${{ steps.duration.outputs.hours }}h full backtest session..."
           timeout ${{ steps.duration.outputs.seconds }}s ./target/release/arb-bot 2>&1 | tee session.log || true
           echo "Session complete."
 
+      - name: Cleanup secrets
+        if: steps.secrets.outputs.available == 'true'
+        run: rm -f /tmp/kalshi_key.pem
+
+      # === PUBLIC-ONLY MODE (without secrets) ===
+      - name: Run public price collection
+        if: steps.secrets.outputs.available != 'true'
+        run: |
+          echo "Running public price collection for ${{ steps.duration.outputs.hours }}h..."
+          END_TIME=$(($(date +%s) + ${{ steps.duration.outputs.seconds }}))
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            echo "--- Snapshot at $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
+            ./target/release/price-collector 2>&1 | tee -a session.log
+            # Wait 5 minutes between snapshots
+            sleep 300
+          done
+
+          echo "Public collection complete."
+
+      # === COMMON STEPS ===
       - name: Generate report
         run: |
           if [ -f backtest_results.db ]; then
@@ -94,13 +143,27 @@ jobs:
             echo "No backtest database found" > report.txt
           fi
 
+          if [ -f price_snapshots.db ]; then
+            echo "" >> report.txt
+            echo "=== Price Snapshot Analysis ===" >> report.txt
+            ./target/release/price-collector --analyze >> report.txt 2>&1 || true
+          fi
+
       - name: Upload backtest database
         uses: actions/upload-artifact@v4
         with:
           name: backtest-db
           path: backtest_results.db
           retention-days: 90
-        if: always()
+        if: always() && hashFiles('backtest_results.db') != ''
+
+      - name: Upload price snapshots database
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-snapshots-db
+          path: price_snapshots.db
+          retention-days: 90
+        if: always() && hashFiles('price_snapshots.db') != ''
 
       - name: Upload session logs
         uses: actions/upload-artifact@v4
@@ -117,14 +180,17 @@ jobs:
           echo "### Backtest Session Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Duration:** ${{ steps.duration.outputs.hours }} hours" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.secrets.outputs.available }}" == "true" ]; then
+            echo "**Mode:** Full backtest (authenticated)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Mode:** Public price collection only" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ℹ️ Add repository secrets for full backtest functionality" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f report.txt ]; then
             echo '```' >> $GITHUB_STEP_SUMMARY
             head -50 report.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
-        if: always()
-
-      - name: Cleanup secrets
-        run: rm -f /tmp/kalshi_key.pem
         if: always()

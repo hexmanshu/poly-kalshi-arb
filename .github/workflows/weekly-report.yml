@@ -1,5 +1,6 @@
 # Generate weekly analysis report
 # Summarizes all backtest sessions and price snapshots
+# NO SECRETS REQUIRED - works immediately after merge
 
 name: Weekly Report
 
@@ -18,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -37,17 +38,21 @@ jobs:
           cargo build --release --bin price-collector
 
       - name: Download backtest database
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v3
         with:
           name: backtest-db
           path: .
+          if_no_artifact_found: warn
+          workflow_conclusion: success
         continue-on-error: true
 
       - name: Download price snapshots
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v3
         with:
           name: price-snapshots-db
           path: .
+          if_no_artifact_found: warn
+          workflow_conclusion: success
         continue-on-error: true
 
       - name: Generate backtest report
@@ -56,7 +61,11 @@ jobs:
             ./target/release/backtest-report --compare > backtest_report.txt 2>&1
             ./target/release/backtest-report --list >> backtest_report.txt 2>&1
           else
-            echo "No backtest data available" > backtest_report.txt
+            echo "No backtest data available yet." > backtest_report.txt
+            echo "" >> backtest_report.txt
+            echo "Backtest data will be collected by:" >> backtest_report.txt
+            echo "  - Scheduled backtest sessions (Sun/Sat)" >> backtest_report.txt
+            echo "  - Manual workflow dispatch" >> backtest_report.txt
           fi
 
       - name: Generate price analysis
@@ -64,7 +73,10 @@ jobs:
           if [ -f price_snapshots.db ]; then
             ./target/release/price-collector --analyze > price_analysis.txt 2>&1
           else
-            echo "No price snapshot data available" > price_analysis.txt
+            echo "No price snapshot data available yet." > price_analysis.txt
+            echo "" >> price_analysis.txt
+            echo "Price snapshots are collected every 15 minutes by the" >> price_analysis.txt
+            echo "Collect Prices workflow. Check back after a few hours." >> price_analysis.txt
           fi
 
       - name: Create combined report
