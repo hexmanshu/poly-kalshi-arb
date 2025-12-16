@@ -3,6 +3,7 @@
 //! Strategy: BUY YES on Platform A + BUY NO on Platform B
 //! Arb exists when: YES_ask + NO_ask < $1.00
 
+mod backtest;
 mod cache;
 mod circuit_breaker;
 mod config;
@@ -12,6 +13,7 @@ mod kalshi;
 mod polymarket;
 mod polymarket_clob;
 mod position_tracker;
+mod strategy;
 mod types;
 
 use anyhow::{Context, Result};
@@ -19,6 +21,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use backtest::AsyncBacktestTracker;
 use cache::TeamCache;
 use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
@@ -27,6 +30,7 @@ use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
 use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
+use strategy::MarketSnapshot;
 use types::{GlobalState, PriceCents};
 
 /// Polymarket CLOB API host
@@ -55,6 +59,15 @@ async fn main() -> Result<()> {
         info!("   Mode: DRY RUN (set DRY_RUN=0 to execute)");
     } else {
         warn!("   Mode: LIVE EXECUTION");
+    }
+
+    // Check for backtest mode (enabled by default in dry run)
+    let backtest_enabled = std::env::var("BACKTEST")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(dry_run);  // Default: enabled if dry run
+
+    if backtest_enabled {
+        info!("   Backtest: ENABLED (tracking {} strategies)", strategy::default_strategies().len());
     }
 
     // Load Kalshi credentials
@@ -170,6 +183,56 @@ async fn main() -> Result<()> {
 
     let exec_handle = tokio::spawn(run_execution_loop(exec_rx, engine));
 
+    // Initialize backtest tracker (if enabled)
+    let backtest_tracker = if backtest_enabled {
+        match AsyncBacktestTracker::new() {
+            Ok(tracker) => {
+                info!("[BACKTEST] Session started: {}", tracker.session_id().await);
+                Some(tracker)
+            }
+            Err(e) => {
+                warn!("[BACKTEST] Failed to initialize: {} - continuing without backtest", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create channel for market updates to backtest tracker
+    let (backtest_tx, mut backtest_rx) = tokio::sync::mpsc::channel::<(u16, String)>(1000);
+
+    // Backtest processing task
+    let backtest_state = state.clone();
+    let backtest_tracker_clone = backtest_tracker.clone();
+    tokio::spawn(async move {
+        if let Some(tracker) = backtest_tracker_clone {
+            while let Some((market_id, description)) = backtest_rx.recv().await {
+                if let Some(market) = backtest_state.get_by_id(market_id) {
+                    let (k_yes, k_no, k_yes_sz, k_no_sz) = market.kalshi.load();
+                    let (p_yes, p_no, p_yes_sz, p_no_sz) = market.poly.load();
+
+                    let snapshot = MarketSnapshot {
+                        market_id,
+                        kalshi_yes: k_yes,
+                        kalshi_no: k_no,
+                        kalshi_yes_size: k_yes_sz,
+                        kalshi_no_size: k_no_sz,
+                        poly_yes: p_yes,
+                        poly_no: p_no,
+                        poly_yes_size: p_yes_sz,
+                        poly_no_size: p_no_sz,
+                        timestamp_ns: 0,  // Will be set by tracker
+                    };
+
+                    if let Err(e) = tracker.process_update(snapshot, &description).await {
+                        warn!("[BACKTEST] Error processing update: {}", e);
+                    }
+                }
+            }
+        }
+    });
+
     // === TEST MODE: Inject fake arb after delay ===
     // TEST_ARB=1 to enable, TEST_ARB_TYPE=poly_yes_kalshi_no|kalshi_yes_poly_no|poly_only|kalshi_only
     let test_arb = std::env::var("TEST_ARB").map(|v| v == "1" || v == "true").unwrap_or(false);
@@ -267,9 +330,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Heartbeat task with arb diagnostics
+    // Heartbeat task with arb diagnostics and backtest stats
     let heartbeat_state = state.clone();
     let heartbeat_threshold = threshold_cents;
+    let heartbeat_backtest = backtest_tracker.clone();
+    let heartbeat_backtest_tx = backtest_tx.clone();
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::kalshi_fee_cents;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -291,6 +356,11 @@ async fn main() -> Result<()> {
                 if p_yes > 0 || p_no > 0 { with_poly += 1; }
                 if has_k && has_p {
                     with_both += 1;
+
+                    // Send market update to backtest tracker
+                    if let Some(pair) = market.pair.as_ref() {
+                        let _ = heartbeat_backtest_tx.try_send((market.market_id, pair.description.to_string()));
+                    }
 
                     let fee1 = kalshi_fee_cents(k_no);
                     let cost1 = p_yes + k_no + fee1;
@@ -334,11 +404,67 @@ async fn main() -> Result<()> {
             } else if with_both == 0 {
                 warn!("   ⚠️  No markets with BOTH Kalshi and Poly prices - check WebSocket connections");
             }
+
+            // Print backtest stats
+            if let Some(ref tracker) = heartbeat_backtest {
+                let (detected, confirmed, slipped, snapshots) = tracker.stats().await;
+                if detected > 0 {
+                    let confirm_rate = if detected > 0 { confirmed as f64 / detected as f64 * 100.0 } else { 0.0 };
+                    let slip_rate = if detected > 0 { slipped as f64 / detected as f64 * 100.0 } else { 0.0 };
+                    info!("   📈 Backtest: {} detected, {} confirmed ({:.1}%), {} slipped ({:.1}%), {} snapshots",
+                          detected, confirmed, confirm_rate, slipped, slip_rate, snapshots);
+                }
+            }
         }
     });
 
+    // Frequent backtest scanner (every 100ms when enabled)
+    let scanner_state = state.clone();
+    let scanner_backtest_tx = backtest_tx;
+    let scanner_handle = tokio::spawn(async move {
+        if !backtest_enabled {
+            // Sleep forever if backtest disabled
+            loop { tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await; }
+        }
+
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let market_count = scanner_state.market_count();
+
+            for market in scanner_state.markets.iter().take(market_count) {
+                let (k_yes, k_no, _, _) = market.kalshi.load();
+                let (p_yes, p_no, _, _) = market.poly.load();
+
+                // Only send if we have prices on both sides
+                if k_yes > 0 && k_no > 0 && p_yes > 0 && p_no > 0 {
+                    if let Some(pair) = market.pair.as_ref() {
+                        let _ = scanner_backtest_tx.try_send((market.market_id, pair.description.to_string()));
+                    }
+                }
+            }
+        }
+    });
+
+    // Handle shutdown gracefully
+    let shutdown_tracker = backtest_tracker.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("\n🛑 Shutting down...");
+
+        if let Some(tracker) = shutdown_tracker {
+            if let Err(e) = tracker.finalize().await {
+                warn!("[BACKTEST] Error finalizing session: {}", e);
+            } else {
+                info!("[BACKTEST] Session finalized. Run `cargo run --bin backtest-report` for analysis.");
+            }
+        }
+
+        std::process::exit(0);
+    });
+
     // Run forever
-    let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle);
+    let _ = tokio::join!(kalshi_handle, poly_handle, heartbeat_handle, exec_handle, scanner_handle);
 
     Ok(())
 }
