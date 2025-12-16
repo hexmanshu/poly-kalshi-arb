@@ -1,0 +1,130 @@
+# Run a backtest session during high-activity periods
+# This workflow runs the full bot in DRY_RUN mode for up to 6 hours
+# to collect real market data and test strategies.
+#
+# Designed for:
+# - NFL Sundays (high sports betting activity)
+# - EPL Saturdays (soccer matches)
+# - NBA evenings
+
+name: Backtest Session
+
+on:
+  schedule:
+    # NFL Sunday: 5PM UTC (12PM ET kickoff)
+    - cron: '0 17 * * 0'
+    # EPL Saturday: 12PM UTC (morning matches)
+    - cron: '0 12 * * 6'
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: 'Session duration (hours, max 5)'
+        required: false
+        default: '2'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hour max
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-full-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-full-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Download previous backtest DB
+        uses: actions/download-artifact@v4
+        with:
+          name: backtest-db
+          path: .
+        continue-on-error: true
+
+      - name: Determine duration
+        id: duration
+        run: |
+          HOURS="${{ github.event.inputs.duration_hours || '2' }}"
+          # Cap at 5 hours to leave time for upload
+          if [ "$HOURS" -gt 5 ]; then HOURS=5; fi
+          echo "hours=$HOURS" >> $GITHUB_OUTPUT
+          echo "seconds=$((HOURS * 3600))" >> $GITHUB_OUTPUT
+
+      - name: Create Kalshi key file
+        run: |
+          echo "${{ secrets.KALSHI_PRIVATE_KEY }}" > /tmp/kalshi_key.pem
+          chmod 600 /tmp/kalshi_key.pem
+
+      - name: Run backtest session
+        env:
+          DRY_RUN: "1"
+          BACKTEST: "1"
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_PATH: /tmp/kalshi_key.pem
+          POLY_PRIVATE_KEY: ${{ secrets.POLY_PRIVATE_KEY }}
+          POLY_FUNDER: ${{ secrets.POLY_FUNDER }}
+          RUST_LOG: "info"
+        run: |
+          echo "Starting ${{ steps.duration.outputs.hours }}h backtest session..."
+          timeout ${{ steps.duration.outputs.seconds }}s ./target/release/arb-bot 2>&1 | tee session.log || true
+          echo "Session complete."
+
+      - name: Generate report
+        run: |
+          if [ -f backtest_results.db ]; then
+            ./target/release/backtest-report --compare > report.txt 2>&1 || true
+            cat report.txt
+          else
+            echo "No backtest database found" > report.txt
+          fi
+
+      - name: Upload backtest database
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-db
+          path: backtest_results.db
+          retention-days: 90
+        if: always()
+
+      - name: Upload session logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-logs-${{ github.run_number }}
+          path: |
+            session.log
+            report.txt
+          retention-days: 30
+        if: always()
+
+      - name: Summary
+        run: |
+          echo "### Backtest Session Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Duration:** ${{ steps.duration.outputs.hours }} hours" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f report.txt ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -50 report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+        if: always()
+
+      - name: Cleanup secrets
+        run: rm -f /tmp/kalshi_key.pem
+        if: always()

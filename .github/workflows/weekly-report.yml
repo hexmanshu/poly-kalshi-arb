@@ -1,0 +1,102 @@
+# Generate weekly analysis report
+# Summarizes all backtest sessions and price snapshots
+
+name: Weekly Report
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Monday 8AM UTC
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-report-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build tools
+        run: |
+          cargo build --release --bin backtest-report
+          cargo build --release --bin price-collector
+
+      - name: Download backtest database
+        uses: actions/download-artifact@v4
+        with:
+          name: backtest-db
+          path: .
+        continue-on-error: true
+
+      - name: Download price snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: price-snapshots-db
+          path: .
+        continue-on-error: true
+
+      - name: Generate backtest report
+        run: |
+          if [ -f backtest_results.db ]; then
+            ./target/release/backtest-report --compare > backtest_report.txt 2>&1
+            ./target/release/backtest-report --list >> backtest_report.txt 2>&1
+          else
+            echo "No backtest data available" > backtest_report.txt
+          fi
+
+      - name: Generate price analysis
+        run: |
+          if [ -f price_snapshots.db ]; then
+            ./target/release/price-collector --analyze > price_analysis.txt 2>&1
+          else
+            echo "No price snapshot data available" > price_analysis.txt
+          fi
+
+      - name: Create combined report
+        run: |
+          echo "# Weekly Arbitrage Bot Report" > weekly_report.md
+          echo "" >> weekly_report.md
+          echo "Generated: $(date -u +%Y-%m-%d)" >> weekly_report.md
+          echo "" >> weekly_report.md
+
+          echo "## Backtest Summary" >> weekly_report.md
+          echo '```' >> weekly_report.md
+          cat backtest_report.txt >> weekly_report.md
+          echo '```' >> weekly_report.md
+          echo "" >> weekly_report.md
+
+          echo "## Price Snapshot Analysis" >> weekly_report.md
+          echo '```' >> weekly_report.md
+          cat price_analysis.txt >> weekly_report.md
+          echo '```' >> weekly_report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report-${{ github.run_number }}
+          path: |
+            weekly_report.md
+            backtest_report.txt
+            price_analysis.txt
+          retention-days: 90
+
+      - name: Post summary
+        run: |
+          echo "### Weekly Report Generated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat weekly_report.md >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,66 @@
+# Collect price snapshots every 5 minutes
+# This workflow fetches current prices from Kalshi and Polymarket
+# and stores them for later analysis.
+#
+# Free tier: ~8,640 runs/month at 5min intervals = ~288 minutes used
+
+name: Collect Prices
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Every 5 minutes
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-collector-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-collector-
+
+      - name: Build collector
+        run: cargo build --release --bin price-collector
+
+      - name: Download previous database
+        uses: actions/download-artifact@v4
+        with:
+          name: price-snapshots-db
+          path: .
+        continue-on-error: true  # First run won't have artifact
+
+      - name: Collect snapshot
+        run: ./target/release/price-collector
+
+      - name: Upload database
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-snapshots-db
+          path: price_snapshots.db
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### Price Snapshot Collected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+          echo "- Database size: $(du -h price_snapshots.db | cut -f1)" >> $GITHUB_STEP_SUMMARY
